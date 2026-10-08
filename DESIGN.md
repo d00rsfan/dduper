@@ -1,3 +1,7 @@
+> Historical document: implementation/build details below predate the maintained
+> Rust application and kernel-ioctl helper. See [INSTALL.md](INSTALL.md)
+> and the current source. Use `tests/validate_local.py` for bounded host validation.
+
 # dduper Design Document
 
 ## 1. Overview

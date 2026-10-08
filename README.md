@@ -5,9 +5,28 @@ dduper is a block-level [out-of-band](https://btrfs.wiki.kernel.org/index.php/De
 fetching built-in checksum from BTRFS csum-tree, instead of reading file blocks
 and computing checksum itself. This *hugely* improves the performance.
 
-Available in both Python and Rust. Please be aware that dduper is beta quality tool, so _validate_ it, before running it on your critical data.
+The maintained implementation is Rust. `./dduper` is a Python standard-library
+compatibility launcher for `target/release/dduper`; it needs no numpy or PTable.
+Build **both** `dduper` and `dduper-btrfs` using `cargo build --release --bins`.
+See [INSTALL.md](INSTALL.md) for setup, helper lookup, and the small local test.
+
+The helper uses the mounted filesystem's kernel ioctls and the file's actual
+subvolume ID. Ubuntu's `btrfs` stays unchanged. Historical patches and the
+bundled 5.7 `bin/btrfs.static` are obsolete and are not used or packaged.
+
+Only the default kernel-verified `FIDEDUPERANGE` mode is enabled. The legacy
+`--fast-mode` option returns an error; `--skip` is accepted for CLI compatibility
+and does not disable kernel verification. This is beta software: validate a
+small disposable dataset before using it on valuable data.
 
 ### Performance
+
+The historical benchmark below applies to checksum-tree reads. Compressed,
+inline, sparse and preallocated files use an explicitly reported logical SHA256
+fallback, which reads file contents. Uncompressed checksummed extents keep the
+checksum-tree optimization. Tokens from the two methods are deliberately
+separate, so differently stored copies can miss deduplication opportunities.
+
 
 dduper is **~40x faster** than traditional SHA256-based approaches because it reads
 checksums from BTRFS's internal csum-tree instead of reading file data from disk.
@@ -32,41 +51,9 @@ To dedupe two files f1 and f2 on partition sda1:
 
 `dduper --device /dev/sda1 --files /mnt/f1 /mnt/f2`
 
-This mode is 100% safe, as it uses the `fideduperange` call, which asks the kernel 
-to verify given regions byte-by-byte, and only perform dedupe when they match.
-
-Dedupe Files Faster (fast mode):
---------------------------------
-
-dduper also has `--fast-mode` option, which tells kernel to skip verifying
-stage and invoke clone directly. This mode is faster since file contents
-are never read. dduper relies on file csum maintained by btrfs csum-tree.
-
-To dedupe two files f1 and f2 on partition sda1 in faster mode:
-
-`dduper --fast-mode --device /dev/sda1 --files /mnt/f1 /mnt/f2`
-
-This works by fetching csums and invokes `ficlonerange` on matching regions.
-For this mode, dduper adds safety check by performing sha256 comparison.
-If validation fails, files can be restored using `/var/log/dduper_backupfile_info.log`.
-This file will contain data like:
-
-`
-FAILURE: Deduplication for /mnt/foo resulted in corruption.You can restore original file from /mnt/foo.__dduper
-`
-
-*Caution: Don't run this, if you don't know what you are doing.*
-
-Dedupe Files blazing fast (insane mode):
-----------------------------------------
-
-If you already have backup data in another partition or systems. You can
-tell dduper to skip file sha256 validation after dedupe (file contents never read).
-This is insanely fast :-)
-
-`dduper --fast-mode --skip --device /dev/sda1 --files /mnt/f1 /mnt/f2`
-
-*Caution: Never run this, if you don't know what you are doing.*
+This mode uses `FIDEDUPERANGE`: the kernel compares the selected regions byte
+for byte and shares extents only when they match. Kernel errors propagate to
+the caller; checksum matches alone never authorize cloning.
 
 Dedupe multiple files:
 ----------------------
@@ -196,15 +183,26 @@ To list duplicate files from a directory:
 `dduper --device /dev/sda1 --dir /mnt --recurse --perfect-match-only`
 
 
-Known Issues:
-------------
+Compatibility and limits:
+-------------------------
 
-- dduper supports ~~only~~ crc32. ~~Doesn't work with csum types like xxhash,blake2, sha256.~~
-  Now Initial support available for xxhash64, blake2 and sha256.
-
-- ~~subvolume won't work with dduper~~ Initial support now available for subvolume, requires more testing.
-
-- Cannot yet de-duplicate identical content blocks within a single file
+- Linux with Btrfs, 4096-byte sectors and current Linux UAPI headers is required.
+- The helper supports CRC32C, xxhash64, SHA256 and BLAKE2b-256 checksum sizes.
+- Subvolume roots are resolved from the open file; no fallback to root 5 occurs.
+- Empty and NODATASUM files return helper status 2 with a diagnostic. Other
+  lookup errors return 1. Only complete, validated output returns 0.
+- Tree searches need CAP_SYS_ADMIN (normally sudo). `--device` must identify a
+  device belonging to the file's mounted Btrfs filesystem.
+- Files should be quiescent. Metadata changes invalidate the invocation-local
+  cache; kernel byte verification protects every actual dedupe operation.
+- Checksum candidates can collide or become stale. `--perfect-match-only` is a
+  checksum candidate report, not proof of byte equality.
+- No persistent DB is reused. Existing `dduper.db` files are ignored and left in
+  place, so prior runs cannot add files outside the requested paths.
+- Checksums are collected in memory; very large files/directories can require
+  substantial RAM. Identical blocks within a single file are not deduplicated.
+- Legacy QEMU tests in `ci/gitlab` and old image-based scripts are historical;
+  use the bounded `tests/validate_local.py` test instead on an existing host.
 
 
 Reporting bugs:
