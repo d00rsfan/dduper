@@ -1,2 +1,1 @@
-numpy
-PTable
+# The Python compatibility launcher uses only the standard library.

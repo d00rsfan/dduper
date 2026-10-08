@@ -1,0 +1,7 @@
+/.git
+/build
+/target
+/.venv
+/bin
+/dduper.db
+/dduper.log

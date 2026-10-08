@@ -3,6 +3,7 @@ name = "dduper"
 version = "0.0.5"
 authors = ["Lakshmipathi Ganapathi <lakshmipathi.g@gmail.com>"]
 edition = "2021"
+default-run = "dduper"
 license = "GPL-2.0"
 description = "BTRFS block-level deduplication tool"
 
@@ -11,17 +12,17 @@ maintainer = "Lakshmipathi Ganapathi <lakshmipathi.g@gmail.com>"
 copyright = "Lakshmipathi Ganapathi <lakshmipathi.g@gmail.com>"
 license-file = ["COPYING", "0"]
 extended-description = """\
-dduper performs BTRFS block-level deduplication by leveraging BTRFS
-checksums to detect duplicate blocks without re-reading file contents,
-making it significantly faster than offline dedup tools that re-hash
-data. Supports per-file and recursive directory dedup with an optional
-SQLite checksum cache."""
+dduper performs BTRFS block-level deduplication using kernel-verified
+FIDEDUPERANGE. Its dedicated helper reads checksums from the mounted
+filesystem's correct subvolume, with logical-data hashing for compressed
+or sparse files. Supports per-file and recursive directory deduplication
+with an invocation-local checksum cache."""
 section = "admin"
 priority = "optional"
 depends = "$auto, libc6"
 assets = [
     ["target/release/dduper", "usr/sbin/dduper", "755"],
-    ["bin/btrfs.static", "usr/sbin/dduper-btrfs", "755"],
+    ["target/release/dduper-btrfs", "usr/sbin/dduper-btrfs", "755"],
     ["README.md", "usr/share/doc/dduper/README.md", "644"],
     ["INSTALL.md", "usr/share/doc/dduper/INSTALL.md", "644"],
     ["CHANGELOG", "usr/share/doc/dduper/changelog", "644"],
@@ -32,7 +33,6 @@ clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.11"
 libc = "0.2"
-regex = "1"
 comfy-table = "7"
 itertools = "0.15"
 log = "0.4"
@@ -40,3 +40,6 @@ env_logger = { version = "0.11", default-features = false, features = ["auto-col
 walkdir = "2"
 anyhow = "1"
 hex = "0.4"
+
+[build-dependencies]
+cc = "1"

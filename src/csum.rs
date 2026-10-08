@@ -1,31 +1,13 @@
 use anyhow::{bail, Context, Result};
-use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::sync::LazyLock;
 
 use crate::db::CsumDb;
 
 // 4KB block size (BTRFS default)
 pub const BLK_SIZE: u64 = 4;
-
-// Matches hex values with or without 0x prefix
-static CSUM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:0x)?[0-9a-fA-F]{2,}").unwrap());
-
-/// Parse btrfs dump-csum output to extract hex checksum values.
-/// Handles both `0x1234abcd` and bare `1234abcd` formats.
-pub fn parse_btrfs_csum_output(output: &str) -> Vec<String> {
-    let mut csums = Vec::new();
-    for line in output.lines() {
-        for cap in CSUM_RE.find_iter(line) {
-            csums.push(cap.as_str().to_string());
-        }
-    }
-    csums
-}
 
 /// Compute SHA256 hash of checksum data (used as short_hash in DB)
 pub fn compute_csum_hash(csums: &[String]) -> String {
@@ -35,57 +17,101 @@ pub fn compute_csum_hash(csums: &[String]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Fetch BTRFS checksums directly (no cache)
-fn do_btrfs_dump_csum(filename: &Path, device: &Path) -> Result<Vec<String>> {
-    let btrfs_bin = if Path::new("/usr/sbin/btrfs.static").exists() {
-        "/usr/sbin/btrfs.static"
-    } else {
-        "btrfs"
-    };
+/// Locate the dedicated helper without falling back to an incompatible btrfs binary.
+pub fn helper_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("DDUPER_BTRFS") {
+        return path.into();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("dduper-btrfs");
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    for path in ["/usr/local/sbin/dduper-btrfs", "/usr/sbin/dduper-btrfs"] {
+        if Path::new(path).is_file() {
+            return path.into();
+        }
+    }
+    "dduper-btrfs".into()
+}
 
-    let output = Command::new(btrfs_bin)
-        .arg("inspect-internal")
-        .arg("dump-csum")
+fn do_btrfs_dump_csum(filename: &Path, device: &Path) -> Result<Vec<String>> {
+    let helper = helper_path();
+    let before = std::fs::metadata(filename)?;
+    let output = Command::new(&helper)
+        .args(["inspect-internal", "dump-csum"])
         .arg(filename)
         .arg(device)
         .output()
-        .context("Failed to execute btrfs command")?;
-
+        .with_context(|| {
+            format!(
+                "{}: checksums unavailable; helper {} could not start (exit status unavailable; stderr unavailable)",
+                filename.display(),
+                helper.display()
+            )
+        })?;
+    let context = format!(
+        "{}: helper {} exit status {}; stderr: {}",
+        filename.display(),
+        helper.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     if !output.status.success() {
-        bail!(
-            "btrfs dump-csum failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("{context}; checksums unavailable");
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_btrfs_csum_output(&stdout))
-}
-
-/// Fetch checksums with DB caching
-pub fn btrfs_dump_csum_cached(filename: &Path, device: &Path, db: &CsumDb) -> Result<Vec<String>> {
-    let fname = filename.to_string_lossy();
-
-    // Check cache first
-    if let Some(cached) = db.get_cached_csum(&fname)? {
-        return Ok(parse_btrfs_csum_output(&cached));
+    let stdout = std::str::from_utf8(&output.stdout)
+        .with_context(|| format!("{context}; checksums unavailable"))?;
+    let csums = crate::protocol::parse(stdout, before.len()).with_context(|| context.clone())?;
+    if signature(&before) != signature(&std::fs::metadata(filename)?) {
+        bail!("{context}; file changed during lookup; checksums unavailable");
     }
-
-    // Cache miss: fetch from BTRFS
-    let csums = do_btrfs_dump_csum(filename, device)?;
-
-    // Store in DB
-    let short_hash = compute_csum_hash(&csums);
-    let csum_str = csums.join(" ");
-    db.insert_csum(&fname, &short_hash, &csum_str)?;
-
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
     Ok(csums)
 }
 
-/// Fetch checksums without caching (for file mode without DB)
-#[allow(dead_code)]
-pub fn btrfs_dump_csum(filename: &Path, device: &Path) -> Result<Vec<String>> {
-    do_btrfs_dump_csum(filename, device)
+type Signature = (u64, u64, u64, i64, i64, i64, i64);
+fn signature(meta: &std::fs::Metadata) -> Signature {
+    use std::os::unix::fs::MetadataExt;
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    )
+}
+
+// Cache only within this process, with filesystem/inode/size and nanosecond times.
+// The SQLite database contains only this invocation's requested files.
+type Cache = HashMap<(std::path::PathBuf, std::path::PathBuf), (Signature, Vec<String>)>;
+thread_local! { static CACHE: std::cell::RefCell<Cache> = std::cell::RefCell::new(HashMap::new()); }
+
+pub fn btrfs_dump_csum_cached(filename: &Path, device: &Path, db: &CsumDb) -> Result<Vec<String>> {
+    let key = (std::fs::canonicalize(filename)?, device.to_path_buf());
+    let stamp = signature(&std::fs::metadata(filename)?);
+    let cached = CACHE.with(|c| {
+        c.borrow()
+            .get(&key)
+            .filter(|(s, _)| *s == stamp)
+            .map(|(_, v)| v.clone())
+    });
+    let csums = match cached {
+        Some(csums) => csums,
+        None => {
+            let csums = do_btrfs_dump_csum(filename, device)?;
+            CACHE.with(|c| c.borrow_mut().insert(key, (stamp, csums.clone())));
+            csums
+        }
+    };
+    let short_hash = compute_csum_hash(&csums);
+    db.insert_csum(&filename.to_string_lossy(), &short_hash, &csums.join(" "))?;
+    Ok(csums)
 }
 
 /// Group checksums into chunks and compute SHA256 hash for each chunk.
@@ -141,11 +167,11 @@ pub fn get_hashes(
 /// Calculate element size based on chunk size in KB.
 /// chunk_sz must be a positive multiple of 128.
 pub fn get_ele_size(chunk_sz: u64) -> Result<usize> {
-    if chunk_sz == 0 || !chunk_sz.is_multiple_of(128) {
-        bail!("Ensure chunk size is a multiple of 128KB (128, 256, 512, etc.)");
+    if chunk_sz == 0 || chunk_sz > 16384 || !chunk_sz.is_multiple_of(128) {
+        bail!("Ensure chunk size is a multiple of 128KB between 128KB and 16MiB");
     }
     let no_of_chunks = chunk_sz / BLK_SIZE;
-    let ele_sz = (no_of_chunks / 8) as usize;
+    let ele_sz = no_of_chunks as usize;
     Ok(ele_sz)
 }
 
@@ -190,34 +216,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_btrfs_csum_output_with_prefix() {
-        let output = "0x12345678 0xabcdef01\n0xdeadbeef\n";
-        let csums = parse_btrfs_csum_output(output);
-        assert_eq!(csums, vec!["0x12345678", "0xabcdef01", "0xdeadbeef"]);
-    }
-
-    #[test]
-    fn test_parse_btrfs_csum_output_bare_hex() {
-        let output = "b9ad82f7 aef24db7 7d58f506 e8fdba47\n12345678\n";
-        let csums = parse_btrfs_csum_output(output);
-        assert_eq!(
-            csums,
-            vec!["b9ad82f7", "aef24db7", "7d58f506", "e8fdba47", "12345678"]
-        );
-    }
-
-    #[test]
-    fn test_parse_empty_output() {
-        let csums = parse_btrfs_csum_output("");
-        assert!(csums.is_empty());
-    }
-
-    #[test]
     fn test_get_ele_size_valid() {
-        assert_eq!(get_ele_size(128).unwrap(), 4);
-        assert_eq!(get_ele_size(256).unwrap(), 8);
-        assert_eq!(get_ele_size(512).unwrap(), 16);
-        assert_eq!(get_ele_size(1024).unwrap(), 32);
+        assert_eq!(get_ele_size(128).unwrap(), 32);
+        assert_eq!(get_ele_size(256).unwrap(), 64);
+        assert_eq!(get_ele_size(512).unwrap(), 128);
+        assert_eq!(get_ele_size(1024).unwrap(), 256);
     }
 
     #[test]

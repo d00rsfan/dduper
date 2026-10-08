@@ -28,7 +28,7 @@ pub struct Opts {
     #[arg(short = 'D', long = "dry-run")]
     pub dry_run: bool,
 
-    /// Will skip backup/validation process
+    /// Legacy compatibility option (safe mode always verifies data in the kernel)
     #[arg(short = 's', long = "skip")]
     pub skip: bool,
 
@@ -36,7 +36,7 @@ pub struct Opts {
     #[arg(short = 'c', long = "chunk-size", default_value = "128")]
     pub chunk_size: u64,
 
-    /// Use ficlonerange call (fast mode)
+    /// Unsupported legacy option; only kernel-verified deduplication is enabled
     #[arg(short = 'm', long = "fast-mode")]
     pub fast_mode: bool,
 

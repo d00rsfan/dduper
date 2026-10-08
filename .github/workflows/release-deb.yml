@@ -125,7 +125,9 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-        run: cargo build --release --target ${{ matrix.target }}
+        # The release step can update Cargo.toml's package version. Let Cargo
+        # update that entry in Cargo.lock while retaining locked dependencies.
+        run: cargo build --release --bins --target ${{ matrix.target }}
 
       - name: Build deb package
         run: |

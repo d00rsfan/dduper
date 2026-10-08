@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
-Cargo.lock
+
+# Local runtime data can contain private paths and checksum records.
+dduper.db
+dduper.db-*
+dduper.log
 
 # Python
 .venv/

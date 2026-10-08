@@ -1,30 +1,18 @@
 use anyhow::{bail, Context, Result};
 use itertools::Itertools;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use walkdir::WalkDir;
 
 use crate::csum;
 use crate::db::CsumDb;
 
-// ioctl constants
-const FICLONERANGE: u64 = 0x4020940d;
+// Linux FIDEDUPERANGE, single destination (same ABI on x86_64 and aarch64).
 const FIDEDUPERANGE: u64 = 0xc0189436;
-
-// ioctl structs (must match kernel ABI)
-#[repr(C)]
-struct FileCloneRange {
-    src_fd: i64,
-    src_offset: u64,
-    src_length: u64,
-    dest_offset: u64,
-}
 
 #[repr(C)]
 struct FileDedupeRange {
@@ -45,8 +33,6 @@ struct FileDedupeRange {
 pub struct DedupeConfig {
     pub device: PathBuf,
     pub dry_run: bool,
-    pub skip: bool,
-    pub fast_mode: bool,
     pub verbose: bool,
     pub analyze: bool,
     pub perfect_match_only: bool,
@@ -117,67 +103,9 @@ pub fn validate_file_pair(src: &Path, dst: &Path, processed: &HashSet<PathBuf>) 
 
     src_stat.file_type().is_file()
         && dst_stat.file_type().is_file()
-        && src_stat.ino() != dst_stat.ino()
+        && (src_stat.dev(), src_stat.ino()) != (dst_stat.dev(), dst_stat.ino())
         && src_stat.len() >= 4096
         && dst_stat.len() >= 4096
-}
-
-// --- SHA256 file comparison (in-process, no external sha256sum) ---
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file =
-        fs::File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-/// Validate dedup results by comparing dst with its backup
-fn validate_results(src_file: &Path, dst_file: &Path, bkup_file: &Path) -> Result<()> {
-    let dst_hash = sha256_file(dst_file)?;
-    let bkup_hash = sha256_file(bkup_file)?;
-
-    if dst_hash == bkup_hash {
-        println!(
-            "Dedupe validation successful {}:{}",
-            src_file.display(),
-            dst_file.display()
-        );
-        fs::remove_file(bkup_file)?;
-    } else {
-        let msg = format!(
-            "\nFAILURE: Deduplication for {} resulted in corruption. You can restore original file from {}",
-            dst_file.display(),
-            bkup_file.display()
-        );
-        println!("{}", msg);
-
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/var/log/dduper_backupfile_info.log")?;
-        writeln!(log, "{}", msg)?;
-    }
-    Ok(())
-}
-
-// --- ioctl wrappers ---
-
-/// Perform FICLONERANGE ioctl (fast mode)
-/// # Safety: direct kernel ioctl call
-unsafe fn ioctl_ficlonerange(dst_fd: i32, range: &FileCloneRange) -> io::Result<()> {
-    let ret = libc::ioctl(dst_fd, FICLONERANGE, range as *const FileCloneRange);
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Perform FIDEDUPERANGE ioctl (safe mode)
@@ -202,8 +130,6 @@ pub fn do_dedupe(
     let src_file_sz = fs::metadata(src_file)?.len();
     let dst_file_sz = fs::metadata(dst_file)?.len();
 
-    let bkup_file = PathBuf::from(format!("{}.__dduper", dst_file.display()));
-
     // Dump checksums (with caching)
     let src_csums = csum::btrfs_dump_csum_cached(src_file, &config.device, &session.db)?;
     let dst_csums = csum::btrfs_dump_csum_cached(dst_file, &config.device, &session.db)?;
@@ -217,11 +143,11 @@ pub fn do_dedupe(
     }
 
     // Check for perfect match
-    let perfect_match = src_csums == dst_csums;
+    let perfect_match = src_file_sz == dst_file_sz && src_csums == dst_csums;
 
     if perfect_match {
         println!(
-            "Perfect match : {} {}",
+            "Checksum match : {} {}",
             src_file.display(),
             dst_file.display()
         );
@@ -282,22 +208,6 @@ pub fn do_dedupe(
     let src_len = no_of_chunks * csum::BLK_SIZE * 1024;
 
     if !config.dry_run {
-        // Create backup (fast mode only, unless skip)
-        if !config.skip {
-            let output = Command::new("cp")
-                .arg("--reflink=always")
-                .arg(dst_file)
-                .arg(&bkup_file)
-                .output()
-                .context("Failed to create reflink backup")?;
-            if !output.status.success() {
-                log::warn!(
-                    "Backup creation failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-
         let src_fd = fs::File::open(src_file)?;
         let dst_fd = fs::OpenOptions::new().write(true).open(dst_file)?;
         let src_fd_raw = src_fd.as_raw_fd();
@@ -313,45 +223,66 @@ pub fn do_dedupe(
                     let dst_offset = dst_idx as u64 * src_len;
 
                     // Adjust length for final chunk
-                    let actual_len = if src_offsets[0] == src_dict.len() - 1 {
-                        src_file_sz - src_offset
-                    } else {
-                        src_len
-                    };
+                    let actual_len =
+                        range_len(src_file_sz, dst_file_sz, src_offset, dst_offset, src_len)?;
 
                     // Safety: these are Linux kernel ioctls operating on valid file descriptors
                     unsafe {
-                        if config.fast_mode {
-                            let range = FileCloneRange {
-                                src_fd: src_fd_raw as i64,
-                                src_offset,
-                                src_length: actual_len,
-                                dest_offset: dst_offset,
-                            };
-                            if let Err(e) = ioctl_ficlonerange(dst_fd_raw, &range) {
-                                eprintln!("ioctl_ficlonerange error: {}", e);
-                            } else {
-                                total_bytes_deduped += actual_len;
-                            }
-                        } else {
-                            let mut range = FileDedupeRange {
-                                src_offset,
-                                src_length: actual_len,
-                                dest_count: 1,
-                                reserved1: 0,
-                                reserved2: 0,
-                                dest_fd: dst_fd_raw as i64,
-                                dest_offset: dst_offset,
-                                bytes_deduped: 0,
-                                status: 0,
-                                reserved3: 0,
-                            };
+                        let mut range = FileDedupeRange {
+                            src_offset,
+                            src_length: actual_len,
+                            dest_count: 1,
+                            reserved1: 0,
+                            reserved2: 0,
+                            dest_fd: dst_fd_raw as i64,
+                            dest_offset: dst_offset,
+                            bytes_deduped: 0,
+                            status: 0,
+                            reserved3: 0,
+                        };
 
-                            if let Ok((bytes_dup, _status)) =
-                                ioctl_fideduperange(src_fd_raw, &mut range)
-                            {
-                                total_bytes_deduped += bytes_dup;
+                        let mut done = 0;
+                        while done < actual_len {
+                            range.src_offset = src_offset + done;
+                            range.dest_offset = dst_offset + done;
+                            range.src_length = actual_len - done;
+                            range.bytes_deduped = 0;
+                            range.status = 0;
+                            let (bytes_dup, status) = ioctl_fideduperange(src_fd_raw, &mut range)
+                                .with_context(|| {
+                                format!(
+                                    "FIDEDUPERANGE {} -> {} offsets {}/{} length {}",
+                                    src_file.display(),
+                                    dst_file.display(),
+                                    range.src_offset,
+                                    range.dest_offset,
+                                    range.src_length
+                                )
+                            })?;
+                            if status == 1 {
+                                eprintln!(
+                                    "Kernel found different bytes: {} -> {} at {}/{}",
+                                    src_file.display(),
+                                    dst_file.display(),
+                                    range.src_offset,
+                                    range.dest_offset
+                                );
+                                break;
                             }
+                            if status != 0 {
+                                bail!(
+                                    "FIDEDUPERANGE {} -> {} failed: status {} ({})",
+                                    src_file.display(),
+                                    dst_file.display(),
+                                    status,
+                                    io::Error::from_raw_os_error(-status)
+                                );
+                            }
+                            if bytes_dup == 0 || bytes_dup > range.src_length {
+                                bail!("FIDEDUPERANGE returned invalid progress: {bytes_dup}");
+                            }
+                            done += bytes_dup;
+                            total_bytes_deduped += bytes_dup;
                         }
                     }
                 }
@@ -368,16 +299,30 @@ pub fn do_dedupe(
         );
 
         // Mark processed in DB
-        session.db.mark_processed(&dst_file.to_string_lossy()).ok();
-
-        // Validate results
-        if !config.skip {
-            validate_results(src_file, dst_file, &bkup_file)?;
+        if total_bytes_deduped == dst_file_sz {
+            session.db.mark_processed(&dst_file.to_string_lossy())?;
         }
     }
 
-    let avail_dedupe_kb = matched_chunks as u64 * actual_chunk_sz;
-    let is_perfect = perfect_match || (avail_dedupe_kb * 1024 == dst_file_sz);
+    let mut available = 0;
+    for key in &matched_keys {
+        let src_offset = src_dict[key][0] as u64 * src_len;
+        for &dst_idx in &dst_dict[key] {
+            available += range_len(
+                src_file_sz,
+                dst_file_sz,
+                src_offset,
+                dst_idx as u64 * src_len,
+                src_len,
+            )?;
+        }
+    }
+    let avail_dedupe_kb = available / 1024;
+    let is_perfect = if config.dry_run {
+        available == dst_file_sz
+    } else {
+        total_bytes_deduped == dst_file_sz
+    };
 
     let stats = DedupeStats {
         chunk_size: actual_chunk_sz,
@@ -451,14 +396,7 @@ pub fn dedupe_files(
 
     // Validate all files first
     for file in files {
-        match validate_file(file) {
-            Ok(_) => {
-                if config.verbose {
-                    println!("{:?} is a regular file.", file);
-                }
-            }
-            Err(e) => println!("{:?} Error: {}", file, e),
-        }
+        validate_file(file)?;
     }
 
     // Process all pairwise combinations
@@ -472,13 +410,9 @@ pub fn dedupe_files(
             continue;
         }
 
-        match do_dedupe(src, dst, config, session) {
-            Ok(stats) => {
-                if stats.perfect_match {
-                    session.processed_files.insert(dst.clone());
-                }
-            }
-            Err(e) => eprintln!("Deduplication error: {}", e),
+        let stats = do_dedupe(src, dst, config, session)?;
+        if stats.perfect_match {
+            session.processed_files.insert(dst.clone());
         }
     }
 
@@ -511,7 +445,7 @@ pub fn dedupe_dir(
     log::debug!("Phase-1.1: Populate records");
     for file in &file_list {
         csum::btrfs_dump_csum_cached(file, &config.device, &session.db)?;
-        session.db.mark_valid(&file.to_string_lossy()).ok();
+        session.db.mark_valid(&file.to_string_lossy())?;
     }
 
     // Phase 2: Detect duplicate files via DB
@@ -542,7 +476,8 @@ fn collect_valid_files(dirs: &[PathBuf], recurse: bool) -> Result<Vec<PathBuf>> 
 
     for dir in dirs {
         if recurse {
-            for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            for entry in WalkDir::new(dir) {
+                let entry = entry?;
                 if entry.file_type().is_file() && validate_file(entry.path()).is_ok() {
                     files.push(entry.into_path());
                 }
@@ -551,7 +486,7 @@ fn collect_valid_files(dirs: &[PathBuf], recurse: bool) -> Result<Vec<PathBuf>> 
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
                 let path = entry.path();
-                if path.is_file() && validate_file(&path).is_ok() {
+                if entry.file_type()?.is_file() && validate_file(&path).is_ok() {
                     files.push(path);
                 }
             }
@@ -559,4 +494,28 @@ fn collect_valid_files(dirs: &[PathBuf], recurse: bool) -> Result<Vec<PathBuf>> 
     }
 
     Ok(files)
+}
+
+/// Bound every ioctl by BOTH EOFs, independently of how many unique hashes exist.
+fn range_len(src_size: u64, dst_size: u64, src: u64, dst: u64, chunk: u64) -> Result<u64> {
+    if src >= src_size || dst >= dst_size || chunk == 0 || chunk > 16 * 1024 * 1024 {
+        bail!(
+            "invalid dedupe range: offsets {src}/{dst}, sizes {src_size}/{dst_size}, chunk {chunk}"
+        );
+    }
+    Ok(chunk.min(src_size - src).min(dst_size - dst))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    #[test]
+    fn final_chunk_and_repeated_hash_ranges_are_bounded() {
+        assert_eq!(
+            range_len(1048577, 1048577, 1048576, 1048576, 131072).unwrap(),
+            1
+        );
+        assert_eq!(range_len(1048576, 1048576, 0, 0, 131072).unwrap(), 131072);
+        assert!(range_len(4096, 4096, 8192, 0, 131072).is_err());
+    }
 }

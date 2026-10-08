@@ -7,6 +7,7 @@ mod cli;
 mod csum;
 mod db;
 mod dedupe;
+mod protocol;
 
 use dedupe::{DedupeConfig, DedupeSession};
 
@@ -33,17 +34,20 @@ fn main() -> Result<()> {
 
     let opts = cli::Opts::parse();
     let start = Instant::now();
-
-    // Set skip to true when not using fast_mode
-    let skip = if opts.fast_mode { opts.skip } else { true };
+    csum::get_ele_size(opts.chunk_size)?;
+    if opts.fast_mode {
+        anyhow::bail!(
+            "--fast-mode is disabled: use the default kernel-verified FIDEDUPERANGE mode"
+        );
+    }
 
     // Open database
     let db = db::CsumDb::open(std::path::Path::new("dduper.db"))?;
 
     if opts.analyze {
-        run_analyze(&opts, skip, db)?;
+        run_analyze(&opts, db)?;
     } else {
-        run_normal(&opts, skip, db)?;
+        run_normal(&opts, db)?;
     }
 
     let duration = start.elapsed();
@@ -52,7 +56,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_analyze(opts: &cli::Opts, skip: bool, db: db::CsumDb) -> Result<()> {
+fn run_analyze(opts: &cli::Opts, db: db::CsumDb) -> Result<()> {
     let chunk_sizes = [128u64, 256, 512, 1024, 2048, 4096, 8192, 16384];
     let mut session = DedupeSession::new(db);
 
@@ -60,8 +64,6 @@ fn run_analyze(opts: &cli::Opts, skip: bool, db: db::CsumDb) -> Result<()> {
         let config = DedupeConfig {
             device: opts.device.clone(),
             dry_run: true, // analyze implies dry_run
-            skip,
-            fast_mode: opts.fast_mode,
             verbose: opts.verbose,
             analyze: true,
             perfect_match_only: opts.perfect_match_only,
@@ -85,12 +87,10 @@ fn run_analyze(opts: &cli::Opts, skip: bool, db: db::CsumDb) -> Result<()> {
     Ok(())
 }
 
-fn run_normal(opts: &cli::Opts, skip: bool, db: db::CsumDb) -> Result<()> {
+fn run_normal(opts: &cli::Opts, db: db::CsumDb) -> Result<()> {
     let config = DedupeConfig {
         device: opts.device.clone(),
-        dry_run: opts.dry_run,
-        skip,
-        fast_mode: opts.fast_mode,
+        dry_run: opts.dry_run || opts.perfect_match_only,
         verbose: opts.verbose,
         analyze: false,
         perfect_match_only: opts.perfect_match_only,

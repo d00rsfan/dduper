@@ -7,9 +7,10 @@ pub struct CsumDb {
 }
 
 impl CsumDb {
-    /// Open or create the dduper.db SQLite database
-    pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path).context("Failed to open dduper.db")?;
+    /// Use an invocation-scoped database: old paths must never enter a new dedupe run.
+    pub fn open(_path: &Path) -> Result<Self> {
+        let conn =
+            Connection::open_in_memory().context("Failed to open session checksum database")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS filehash (
                 filename TEXT,
@@ -28,6 +29,16 @@ impl CsumDb {
 
     /// Insert checksum data for a file
     pub fn insert_csum(&self, filename: &str, short_hash: &str, csum_data: &str) -> Result<()> {
+        let present: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM filehash WHERE filename = ?1 AND short_hash = ?2)",
+            rusqlite::params![filename, short_hash],
+            |row| row.get(0),
+        )?;
+        if present {
+            return Ok(());
+        }
+        self.conn
+            .execute("DELETE FROM filehash WHERE filename = ?1", [filename])?;
         self.conn.execute(
             "INSERT INTO filehash VALUES (?1, ?2, 0, 0)",
             rusqlite::params![filename, short_hash],
@@ -51,6 +62,7 @@ impl CsumDb {
     }
 
     /// Check if checksums are cached for a file, return them if so
+    #[cfg(test)]
     pub fn get_cached_csum(&self, filename: &str) -> Result<Option<String>> {
         let result: Option<String> = self
             .conn
@@ -141,10 +153,12 @@ impl CsumDb {
 }
 
 /// Extension trait for optional query results
+#[cfg(test)]
 trait OptionalExt<T> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error>;
 }
 
+#[cfg(test)]
 impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error> {
         match self {
